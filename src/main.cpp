@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <math.h>
 #include "EMMA_Stepper_Motor.h"
@@ -24,6 +23,7 @@ Preferences prefs; // Создаем объект для работы с пам�
 
 // ── Настройка динамического роутинга логов ──
 enum LogRoute {
+    LOG_SILENT   = 0, // Полная тишина (0) — логи отключены
     LOG_ONLY_BT  = 1, // Только Блютуз
     LOG_ONLY_USB = 2, // Только USB провод
     LOG_BOTH     = 3  // И туда, и туда
@@ -874,6 +874,10 @@ float inv_ease(float p) {
 unsigned long bow_total_timer = 0;
 unsigned long bow_total_ms = 0;
 
+// Момент окончания последнего /bow — для точного замера overhead в auto_sync
+// (захватывает ВСЕ задержки: loop()-gaps, LOG_PRINTF, queue scheduling)
+unsigned long auto_sync_beat_end_ms = 0;
+
 /// =======================================================================================================
 void reset_bow_total_timer() {
     bow_total_timer = millis();   // current millis value
@@ -894,7 +898,7 @@ byte is_bow_total_timer(uint16_t p_t) {
 /// =======================================================================================================
 
 // ── Start single bow stroke ──────────
-void bow_start_cmd(int dir, unsigned long duration_ms, float speed) {
+void bow_start_cmd(int dir, unsigned long duration_ms, float speed, bool keep_position = false) {
     reset_bow_total_timer();  
     bow_timeout = duration_ms;
     bow_speed = speed;
@@ -920,19 +924,21 @@ void bow_start_cmd(int dir, unsigned long duration_ms, float speed) {
         bow_direction = 1; 
     }
 
-    // вычислить стартовую позицию от текущего прицела руки
-    float dx = P1_X - P0_X;
-    float dy = P1_Y - P0_Y;
-    float p;
-    if (fabsf(dx) > fabsf(dy)) {
-        p = (arm_target_x - P0_X) / dx;
-    } else {
-        p = (arm_target_y - P0_Y) / dy;
-    }
-    if (p < 0.0f) p = 0.0f;
-    if (p > 1.0f) p = 1.0f;
+    if (!keep_position) {
+        // вычислить стартовую позицию от текущего прицела руки
+        float dx = P1_X - P0_X;
+        float dy = P1_Y - P0_Y;
+        float p;
+        if (fabsf(dx) > fabsf(dy)) {
+            p = (arm_target_x - P0_X) / dx;
+        } else {
+            p = (arm_target_y - P0_Y) / dy;
+        }
+        if (p < 0.0f) p = 0.0f;
+        if (p > 1.0f) p = 1.0f;
 
-    bow_position = inv_ease(p);
+        bow_position = inv_ease(p);
+    }
 
     reset_bow_timer();
     bow_last_time = millis();
@@ -1080,6 +1086,7 @@ void bow_update() {
     if (is_bow_timer(bow_timeout) == 1) {
         bow_active = false;
         bow_total_ms = millis() - bow_total_timer;
+        auto_sync_beat_end_ms = millis(); // фиксируем момент конца смычка
         LOG_PRINTF("[BOW] cmd='%s' Total: %lu ms\n", last_command.c_str(), bow_total_ms);
         return;
     }
@@ -1109,6 +1116,7 @@ void bow_update() {
         } else {
             bow_active = false;
             bow_total_ms = millis() - bow_total_timer;
+            auto_sync_beat_end_ms = millis(); // фиксируем момент конца смычка
             LOG_PRINTF("[BOW] cmd='%s' Total: %lu ms (Hit Upper Limit)\n", last_command.c_str(), bow_total_ms);
         }
     }
@@ -1120,6 +1128,7 @@ void bow_update() {
         } else {
             bow_active = false;
             bow_total_ms = millis() - bow_total_timer;
+            auto_sync_beat_end_ms = millis(); // фиксируем момент конца смычка
             LOG_PRINTF("[BOW] cmd='%s' Total: %lu ms (Hit Lower Limit)\n", last_command.c_str(), bow_total_ms);
         }
     }
@@ -1127,12 +1136,12 @@ void bow_update() {
     if (bow_position >= 1.0f) { 
         bow_position = 1.0f; 
         if (bow_looping) bow_direction = -1;
-        else { bow_active = false; bow_total_ms = millis() - bow_total_timer; }
+        else { bow_active = false; bow_total_ms = millis() - bow_total_timer; auto_sync_beat_end_ms = millis(); }
     }
     else if (bow_position <= 0.0f) { 
         bow_position = 0.0f; 
         if (bow_looping) bow_direction = 1;
-        else { bow_active = false; bow_total_ms = millis() - bow_total_timer; }
+        else { bow_active = false; bow_total_ms = millis() - bow_total_timer; auto_sync_beat_end_ms = millis(); }
     }
 
     // Получаем реальную пространственную позицию
@@ -1641,6 +1650,106 @@ unsigned long sn_start_ms = 0;   // момент старта команды /sn
 unsigned long sn_total_ms = 0;   // длительность последней команды /sn
 
 
+// ╔══════════════════════════════════════════════╗
+// ║            AUTO_SYNC (Smart Timing)          ║
+// ╚══════════════════════════════════════════════╝
+
+// Включается командой /auto_sync;1, выключается /auto_sync;0
+bool auto_sync_enabled = false;
+
+// Время (мс), которое ушло на блокирующую механику ДО смычка (например, /sn)
+// Обновляется автоматически из sn_total_ms в момент выдачи /bow
+unsigned long auto_sync_overhead_ms = 0;
+
+// Абсолютная целевая позиция каретки смычка (в «виртуальных» единицах позиции 0.0-1.0).
+// Накапливается от команды к команде и корректирует дрейф округления.
+float auto_sync_target_position = -1.0f;  // -1 = не инициализирована
+
+// Статистика для /sync_status
+float  auto_sync_last_ideal_time   = 0;
+float  auto_sync_last_actual_time  = 0;
+float  auto_sync_last_ideal_speed  = 0;
+float  auto_sync_last_actual_speed = 0;
+unsigned long auto_sync_last_overhead = 0;
+int    auto_sync_corrections = 0;          // счётчик применённых коррекций
+
+// ── Применить коррекцию к параметрам /bow ────────────────────────────────
+// Вызывается из обработчика /bow, ЕСЛИ auto_sync_enabled == true.
+// Модифицирует dur и spd «на месте» (передаём по ссылке).
+bool auto_sync_apply(int dir, unsigned long &dur, float &spd) {
+    // Точный замер overhead: от конца предыдущего /bow до старта этого /bow.
+    // Захватывает ВСЁ: время /sn + задержки loop() + LOG_PRINTF + очередь.
+    unsigned long overhead = 0;
+    if (auto_sync_beat_end_ms > 0) {
+        overhead = millis() - auto_sync_beat_end_ms;
+    } else {
+        overhead = sn_total_ms; // fallback для первого /bow в серии
+    }
+    auto_sync_overhead_ms = overhead;
+    auto_sync_last_overhead = overhead;
+
+    // Если накладные расходы нулевые — ничего не трогаем
+    if (overhead == 0) return false;
+
+    // ВАЖНО: bow_speed работает в системе позиция/секунду
+    // (bow_position += bow_speed * 0.01 при 100 Гц)
+    // Поэтому ВСЁ время переводим в секунды!
+    float ideal_time_s  = (float)dur / 1000.0f;          // сек
+    float overhead_s    = (float)overhead / 1000.0f;     // сек
+    float ideal_speed   = spd;                            // позиция/сек
+
+    // Целевая дистанция (в единицах bow_position 0.0-1.0)
+    float target_distance = ideal_speed * ideal_time_s;
+
+    // Реальное оставшееся время (сек)
+    float actual_time_s = ideal_time_s - overhead_s;
+
+    // Защита: если времени совсем не осталось — пропускаем
+    if (actual_time_s <= 0.010f) {   // меньше 10 мс
+        LOG_PRINTF("[AUTO_SYNC] WARNING: actual_time=%.1f ms <= 10 ms — bow skipped!\n", actual_time_s * 1000.0f);
+        return false;
+    }
+
+    // Новая скорость (float-точность, позиция/сек)
+    float actual_speed = target_distance / actual_time_s;
+
+    // --- Компенсация накопления ошибки округления ---
+    // Отслеживаем АБСОЛЮТНУЮ целевую позицию смычка (0.0-1.0)
+    if (auto_sync_target_position < 0.0f) {
+        // Первый запуск — инициализируем из текущей позиции
+        auto_sync_target_position = bow_position;
+    }
+    // Идеальная дельта позиции за этот ход (в единицах bow_position):
+    float ideal_delta = ideal_speed * ideal_time_s;
+    // dir: 0 = назад, 1 = вперёд, 2 = цикл (для цикла коррекция не применяется — skip ниже)
+    float next_target = auto_sync_target_position + (dir == 0 ? -ideal_delta : ideal_delta);
+    // Корректируем скорость так, чтобы за actual_time_s попасть точно в next_target
+    float corrected_delta = fabsf(next_target - bow_position);
+    if (corrected_delta > 0.0001f) {
+        actual_speed = corrected_delta / actual_time_s;
+    }
+    auto_sync_target_position = next_target;   // запоминаем на следующий шаг
+
+    // Сохраняем статистику (время в мс для читаемости)
+    auto_sync_last_ideal_time   = ideal_time_s * 1000.0f;
+    auto_sync_last_actual_time  = actual_time_s * 1000.0f;
+    auto_sync_last_ideal_speed  = ideal_speed;
+    auto_sync_last_actual_speed = actual_speed;
+    auto_sync_corrections++;
+
+    LOG_PRINTF("[AUTO_SYNC] overhead=%lu ms | ideal: t=%.0f ms spd=%.4f | actual: t=%.0f ms spd=%.4f | dist=%.4f\n",
+        overhead,
+        ideal_time_s * 1000.0f, ideal_speed,
+        actual_time_s * 1000.0f, actual_speed,
+        target_distance);
+
+    // Применяем коррекцию (dur возвращаем в мс!)
+    dur = (unsigned long)(actual_time_s * 1000.0f);
+    spd = actual_speed;
+    return true;
+}
+
+
 bool sn_string_changed = false;   // поменялась ли струна в этой команде
 
 /// =======================================================================================================
@@ -1922,6 +2031,7 @@ int   queue_count = 0;          // сколько команд загружен�
 int   queue_index = 0;          // какая команда сейчас играется
 bool  loading  = false;         // идёт приём строк
 bool  playing  = false;         // идёт воспроизведение
+unsigned long load_last_ms = 0; // время последнего принятого байта (для таймаута загрузки)
 
 // ── Войти в режим приёма ─────────────
 void queue_load_start() {
@@ -1929,6 +2039,7 @@ void queue_load_start() {
     playing = false;
     queue_count = 0;
     queue_index = 0;
+    load_last_ms = millis(); // Взводим таймер сторожа загрузки
 }
 
 // ── Добавить строку в очередь ────────
@@ -1945,6 +2056,8 @@ void queue_add(String line) {
 void queue_load_end() {
     loading = false;
     LOG_PRINTF("[QUEUE] Loaded %d commands\n", queue_count);
+
+    beep_yes();
 }
 
 // ── Запустить воспроизведение ────────
@@ -2008,6 +2121,10 @@ void pause_update() {
     if (!pause_active) return;
     if (is_pause_timer(pause_duration) == 1) {
         pause_active = false;
+        // Сбрасываем метку конца смычка: /p — это музыкальная пауза,
+        // а не накладные расходы механики. Следующий /bow должен считать
+        // overhead только от /sn, а не от (конец смычка + длина паузы).
+        auto_sync_beat_end_ms = 0;
     }
 }
 
@@ -2170,6 +2287,11 @@ void executeCommand(String input) {
         LOG_PRINTLN("/end                    - Завершить запись сценария");
         LOG_PRINTLN("/play                   - Воспроизвести сценарий");
         LOG_PRINTLN("/stop                   - Остановить воспроизведение");
+        LOG_PRINTLN("\n--- 🎯 УМНАЯ СИНХРОНИЗАЦИЯ (AUTO_SYNC) ---");
+        LOG_PRINTLN("/auto_sync;1            - Включить авто-коррекцию времени смычка");
+        LOG_PRINTLN("/auto_sync;0            - Выключить авто-коррекцию");
+        LOG_PRINTLN("/auto_sync              - Показать статус (вкл/выкл, кол-во коррекций)");
+        LOG_PRINTLN("/sync_status            - Подробный отчёт последней коррекции");
         LOG_PRINTLN("═════════════════════════════════════════════════════════");
 
 
@@ -2244,11 +2366,15 @@ void executeCommand(String input) {
 
     if (cmd() == "/log_mode") {
         int newMode = getInt(1);
-        if (newMode >= 1 && newMode <= 3) {
+        if (newMode >= 0 && newMode <= 3) {
             currentLogMode = (LogRoute)newMode;
-            LOG_PRINTF("[SYS] Log mode changed to: %d\n", newMode);
+            // Подтверждение выводим ТОЛЬКО если режим не тихий
+            if (newMode > 0) {
+                LOG_PRINTF("[SYS] Log mode: %d (%s)\n", newMode,
+                    newMode == 1 ? "BT only" : newMode == 2 ? "USB only" : "BOTH");
+            }
         } else {
-            LOG_PRINTF("[SYS] ERROR! Unknown mode: %d. Use 1 (BT), 2 (USB), 3 (BOTH)\n", newMode);
+            LOG_PRINTF("[SYS] ERROR! Use: 0=OFF, 1=BT, 2=USB, 3=BOTH\n");
         }
     }
 
@@ -2359,10 +2485,26 @@ void executeCommand(String input) {
     // ── 4. СМЫЧОК И ТРАЕКТОРИЯ ──
     if (cmd() == "/bow") {
         int dir = getInt(1);
-        unsigned long dur = getInt(2);
-        float spd = getFloat(3) / 100.0;
-        bow_start_cmd(dir, dur, spd);
-        LOG_PRINTF("[BOW CMD] Started! dir: %d, time: %lu ms, speed: %.2f, current_pos: %.2f\n", dir, dur, spd, bow_position);
+        unsigned long dur = (unsigned long)getInt(2);
+        float spd = getFloat(3) / 100.0f;
+        bool keep_pos = false;
+
+        if (auto_sync_enabled) {
+            bool ok = auto_sync_apply(dir, dur, spd);
+            if (!ok && auto_sync_overhead_ms > 0) {
+                // Времени не осталось совсем — пропускаем движение смычка
+                LOG_PRINTLN("[AUTO_SYNC] Bow stroke SKIPPED (no time left).");
+                return;
+            }
+            if (ok) {
+                // Если мы в авто-синхронизации, позиция смычка строго контролируется математикой.
+                // Запрещаем bow_start_cmd сбрасывать её на основе IK-целей руки.
+                keep_pos = true;
+            }
+        }
+
+        bow_start_cmd(dir, dur, spd, keep_pos);
+        LOG_PRINTF("[BOW CMD] Started! dir: %d, time: %lu ms, speed: %.4f, current_pos: %.2f\n", dir, dur, spd, bow_position);
     }
 
     if (cmd() == "/bow_loop") {
@@ -2602,6 +2744,53 @@ void executeCommand(String input) {
             LOG_PRINTLN("");
         }
     }
+    // /nudge;S;N;dMM : сдвинуть ноту N струны S на dMM мм и сразу переехать на неё с нажатием пальца
+    if (cmd() == "/nudge") {
+        if (_argCount >= 4) {
+            int   str_num  = getInt(1);
+            int   note_num = getInt(2);
+            float d_mm     = getFloat(3);
+
+            if (str_num >= 1 && str_num <= 4 && note_num >= 1 && note_num <= 7) {
+                if (sn_step != 0 || fingers_are_busy() || calibrating) {
+                    LOG_PRINTLN("[NUDGE] BUSY");
+                } else {
+                    const float MAX_STEP_MM = 5.0f;   // защита от дикой команды
+                    const float MIN_POS_MM  = 5.0f;   // границы каретки
+                    const float MAX_POS_MM  = 125.0f;
+
+                    d_mm = constrain(d_mm, -MAX_STEP_MM, MAX_STEP_MM);
+
+                    long old_steps = x_note[str_num - 1][note_num - 1];
+                    long delta_steps = lroundf(d_mm * pulses_per_mm);
+
+                    // Если просят сдвинуть, но из-за малого d_mm получилось 0 шагов — двигаем минимум на 1 шаг
+                    if (delta_steps == 0 && fabsf(d_mm) > 0.001f) {
+                        delta_steps = (d_mm > 0.0f) ? 1 : -1;
+                    }
+
+                    long new_steps = constrain(old_steps + delta_steps,
+                                               (long)(MIN_POS_MM * pulses_per_mm),
+                                               (long)(MAX_POS_MM * pulses_per_mm));
+                    x_note[str_num - 1][note_num - 1] = new_steps;
+
+                    // Реальный сдвиг в мм (чтобы Python точно считал сумму сдвигов)
+                    float real_d_mm = (float)(new_steps - old_steps) / pulses_per_mm;
+                    float new_pos_mm = (float)new_steps / pulses_per_mm;
+
+                    LOG_PRINTF("[NUDGE] S%d N%d: %+.2f -> %.2f мм\n",
+                               str_num, note_num, real_d_mm, new_pos_mm);
+
+                    set_string_and_note(str_num, note_num, 1); // поднять палец -> переехать -> нажать
+                }
+            } else {
+                LOG_PRINTLN("[NUDGE] ОШИБКА: струна 1-4, нота 1-7");
+            }
+        } else {
+            LOG_PRINTLN("[NUDGE] ОШИБКА: /nudge;<струна>;<нота>;<мм>");
+        }
+    }
+    
 
     if (cmd() == "/violin") {
         set_violin_angle(getInt(1));
@@ -2678,7 +2867,7 @@ void executeCommand(String input) {
         pause_start(getInt(1));
     }
 
-    if (cmd() == "/load_test") {
+    if (cmd() == "/load") {
         queue_load_start();
     }
 
@@ -2704,6 +2893,57 @@ void executeCommand(String input) {
         beep_no_long();
         LOG_PRINTLN("[AUDIO] Signal: NO");
     }
+
+    // ── AUTO_SYNC ──
+    if (cmd() == "/auto_sync") {
+        if (_argCount >= 2) {
+            int state = getInt(1);
+            auto_sync_enabled = (state == 1);
+            // При включении сбрасываем всё состояние (начнём с нуля)
+            if (auto_sync_enabled) {
+                auto_sync_target_position = -1.0f;
+                auto_sync_corrections = 0;
+                auto_sync_beat_end_ms = 0;  // сброс! иначе старый timestamp от ручного
+                                            // нажатия смычка даст огромный overhead
+                LOG_PRINTLN("[AUTO_SYNC] ВКЛЮЧЕН. Умная синхронизация активна.");
+            } else {
+                LOG_PRINTLN("[AUTO_SYNC] ВЫКЛЮЧЕН.");
+            }
+            beep_yes();
+        } else {
+            LOG_PRINTF("[AUTO_SYNC] Статус: %s | Коррекций сделано: %d\n",
+                auto_sync_enabled ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН",
+                auto_sync_corrections);
+        }
+    }
+
+    if (cmd() == "/sync_status") {
+        LOG_PRINTLN("╔═══════════ AUTO_SYNC STATUS ═══════════╗");
+        LOG_PRINTF("║ Режим       : %s\n", auto_sync_enabled ? "ВКЛЮЧЕН" : "ВЫКЛЮЧЕН");
+        LOG_PRINTF("║ Коррекций   : %d\n", auto_sync_corrections);
+        LOG_PRINTF("║ Накладные   : %lu мс (последние)\n", auto_sync_last_overhead);
+        LOG_PRINTF("║ Ideal time  : %.1f мс\n", auto_sync_last_ideal_time);
+        LOG_PRINTF("║ Actual time : %.1f мс\n", auto_sync_last_actual_time);
+        LOG_PRINTF("║ Ideal speed : %.5f\n", auto_sync_last_ideal_speed);
+        LOG_PRINTF("║ Actual speed: %.5f\n", auto_sync_last_actual_speed);
+        LOG_PRINTF("║ Target pos  : %.5f\n", auto_sync_target_position);
+        LOG_PRINTF("║ Bow pos now : %.5f\n", bow_position);
+        LOG_PRINTLN("╚════════════════════════════════════════╝");
+    }
+
+    if (cmd() == "/dump") {
+        LOG_PRINTF("[QUEUE] === СОДЕРЖИМОЕ ОЧЕРЕДИ (%d команд) ===\n", queue_count);
+        for (int i = 0; i < queue_count; i++) {
+            LOG_PRINTF("[%04d] %s\n", i, queue_cmd[i]);
+
+            // Обязательная микро-пауза!
+            // Без нее ESP32 попытается выплюнуть 2000 строк за миллисекунду,
+            // переполнит свой собственный TX-буфер UART и уйдет в перезагрузку (Watchdog reset).
+            delay(2);
+        }
+        LOG_PRINTLN("[QUEUE] === КОНЕЦ ===\n");
+    }
+
 }
 
 
@@ -2713,31 +2953,75 @@ void executeCommand(String input) {
 // ║            COMMAND INPUTS                     ║
 // ╚══════════════════════════════════════════════╝
 
-// ── USB serial input ─────────────────
-void handleUSB() {
-    if (!Serial.available()) return;
-    String input = Serial.readString();
+// ── Неблокирующий построчный приём (USB и BT) ──
+// Забирает ВСЁ, что накопилось в буфере порта, за один вызов.
+// Строки при загрузке сценария уходят в очередь без ожидания таймаутов.
+struct LineReader {
+    char     buf[128];
+    uint8_t  len  = 0;
+    uint32_t last = 0;   // время последнего принятого байта
+};
+
+LineReader usbLine;
+LineReader btLine;
+
+// true  = строка ушла в очередь (можно читать дальше)
+// false = выполнена команда (выходим, чтобы loop() обновил остальное)
+static bool dispatch_line(const char* s) {
+    String input(s);
     input.trim();
 
-    if (loading && input != "/end") {
+    // Мгновенно отбрасываем пустые строки и комментарии
+    if (input.length() == 0)        return true;
+    if (input.startsWith("//"))     return true;
+
+    if (loading) {
+        load_last_ms = millis(); // Обновляем сторожевой таймер загрузки
+        if (input == "/end") {
+            queue_load_end();
+            return true;
+        }
         queue_add(input);
-    } else {
-        executeCommand(input);
+        return true;
+    }
+
+    // Обычный режим: немедленно выполнить команду
+    executeCommand(input);
+    return false;
+}
+
+static void pump_stream(Stream &st, LineReader &lr) {
+    int budget = 4096;   // защита: не застрять в цикле надолго
+    while (st.available() && budget--) {
+        int c = st.read();
+        if (c < 0) break;
+        lr.last = millis();
+
+        if (c == '\n' || c == '\r') {
+            if (lr.len) {
+                lr.buf[lr.len] = 0;
+                lr.len = 0;
+                if (!dispatch_line(lr.buf)) return;
+            }
+        } else if (lr.len < sizeof(lr.buf) - 1) {
+            lr.buf[lr.len++] = (char)c;
+        }
+    }
+
+    // Команда без перевода строки (например, из Serial Monitor):
+    // выполняем после 30 мс тишины
+    if (lr.len && millis() - lr.last > 30) {
+        lr.buf[lr.len] = 0;
+        lr.len = 0;
+        dispatch_line(lr.buf);
     }
 }
+
+// ── USB serial input ─────────────────
+void handleUSB() { pump_stream(Serial,   usbLine); }
 
 // ── Bluetooth input ──────────────────
-void handleBT() {
-    if (!SerialBT.available()) return;
-    String input = SerialBT.readStringUntil('\n');
-    input.trim();
-
-    if (loading && input != "/end") {
-        queue_add(input);
-    } else {
-        executeCommand(input);
-    }
-}
+void handleBT()  { pump_stream(SerialBT, btLine);  }
 
 // ╔══════════════════════════════════════════════╗
 // ║            ESP-NOW                           ║
@@ -2817,6 +3101,9 @@ void queue_update() {
 
 void setup() {
 
+    // Большой буфер приёма: сценарий приходит блоком быстрее, чем loop() его забирает.
+    // Должен вызываться ДО Serial.begin().
+    Serial.setRxBufferSize(8192);
     Serial.begin(115200);
 
 // ── Загрузка настроек из NVS памяти ──
@@ -2984,9 +3271,22 @@ void setup() {
 // ╚══════════════════════════════════════════════╝
 
 void loop() {
-    // Handling communications
+    // Handling communications — всегда первыми, чтобы не переполнить буфер UART
     handleUSB();
     handleBT();
+
+    // ── Вытесняющий режим загрузки ────────────────────────────────────────────
+    // Пока идёт загрузка сценария, блокируем все остальные процессы.
+    // Таймаут 1 сек без новых данных автоматически прерывает загрузку.
+    if (loading) {
+        if (millis() - load_last_ms > 1000) {
+            loading = false;
+            LOG_PRINTLN("[QUEUE] ОШИБКА: Загрузка прервана по таймауту (нет данных 1 сек)!");
+        }
+        return; // Блокируем выполнение остальных процессов (экрана, моторов, сенсоров), пока идет загрузка
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     handleESPNow();
     handleMega();
 
@@ -3079,6 +3379,3 @@ void loop() {
 /lift_mg_set;100;10
 /lift_mg_set;95;10
 */
-
-
-
