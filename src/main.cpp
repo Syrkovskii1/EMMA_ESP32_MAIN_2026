@@ -1915,7 +1915,7 @@ float  getFloat(int i) { return _args[i].toFloat(); } // Added for precise IK co
 // ║            SCENARIO QUEUE (/load_test)       ║
 // ╚══════════════════════════════════════════════╝
 
-#define QUEUE_MAX  200          // максимум команд в очереди
+#define QUEUE_MAX  1000          // максимум команд в очереди
 
 char  queue_cmd[QUEUE_MAX][40]; // тексты команд
 int   queue_count = 0;          // сколько команд загружено
