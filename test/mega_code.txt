@@ -1,0 +1,371 @@
+#include <Arduino.h>
+
+// Переименовываем Serial1 для удобства
+#define EspSerial Serial1
+
+// ── Умный роутинг ответов ──
+Print* replyPort = &Serial; // По умолчанию смотрим в USB
+
+#define REPLY(x)   { replyPort->print(x); }
+#define REPLYLN(x) { replyPort->println(x); }
+
+// Пины управления гироскутером (перенесены на 50-53)
+const uint8_t OUT_PIN1 = 53;
+const uint8_t OUT_PIN2 = 52;
+const uint8_t OUT_PIN3 = 51;
+const uint8_t OUT_PIN4 = 50;
+
+// ── Настройки мотора IBT_2 (10-bit PWM) ──
+const uint8_t RPWM_PIN = 6; // Таймер 4, канал A (OCR4A)
+const uint8_t LPWM_PIN = 7; // Таймер 4, канал B (OCR4B)
+const uint8_t EN_PIN = 8;   // Включение драйвера
+
+float targetAngle = 0.0;
+bool motorActive = false;   // Флаг, разрешающий работу мотора
+
+
+
+// ── Настройки вычислений угла ──
+const uint8_t POT_PIN = A0;
+
+int centerAdc = 607;       // 0 градусов
+int leftAdc = 795;         // +90 градусов
+int rightAdc = 421;        // -90 градусов
+
+float maxAngle = 90.0;     
+
+// Глобальные переменные
+int currentAdc = 0;
+float currentAngle = 0.0;
+
+// ── Математика датчика ──
+void calculatePosition() {
+    currentAdc = analogRead(POT_PIN);
+    
+    if (currentAdc == centerAdc) {
+        currentAngle = 0.0;
+    } 
+    else if (currentAdc > centerAdc) {
+        // Крутим ВЛЕВО (от 607 до 795) -> получаем от 0 до +90
+        float deltaAdc = currentAdc - centerAdc;
+        float rangeAdc = leftAdc - centerAdc; 
+        currentAngle = (deltaAdc / rangeAdc) * maxAngle; 
+    } 
+    else {
+        // Крутим ВПРАВО (от 607 до 421) -> получаем от 0 до -90
+        float deltaAdc = centerAdc - currentAdc;
+        float rangeAdc = centerAdc - rightAdc; 
+        currentAngle = -(deltaAdc / rangeAdc) * maxAngle; 
+    }
+    
+    // Обрезаем угол, чтобы при небольшом люфте он не улетал за пределы +-90
+    currentAngle = constrain(currentAngle, -maxAngle, maxAngle);
+}
+
+
+// ── Управление через регистры ──
+void driveMotor(int pwm) {
+    pwm = constrain(pwm, -1023, 1023); // Новый предел!
+
+    if (pwm == 0) {
+        digitalWrite(EN_PIN, LOW); // Полностью обесточиваем драйвер (надежный стоп)
+        OCR4A = 0;
+        OCR4B = 0;
+    } else if (pwm > 0) {
+        digitalWrite(EN_PIN, HIGH); // Пробуждаем драйвер
+        OCR4A = pwm;                // Пин 6
+        OCR4B = 0;                  // Пин 7
+    } else {
+        digitalWrite(EN_PIN, HIGH); // Пробуждаем драйвер
+        OCR4A = 0;                  // Пин 6
+        OCR4B = abs(pwm);           // Пин 7
+    }
+}
+
+// ── Настройки ПД-регулятора ──
+float Kp = 12.0;
+float Kd = 6.0;         // ← новое: торможение (подобрать под механику)
+int maxPwm = 600; 
+const float deadZone = 1.5;
+
+// ── Состояние ПД-регулятора ──
+static float lastError = 0.0;
+static unsigned long lastTime = 0;
+
+// ── Стабильный ПД-регулятор с ramp и удержанием ──
+void updateMotor() {
+    if (!motorActive) {
+        driveMotor(0);
+        lastError = 0;
+        lastTime = 0;
+        return;
+    }
+
+    float error = currentAngle - targetAngle;
+    unsigned long now = micros();
+    float dt = (lastTime == 0) ? 0.001 : (now - lastTime) / 1e6;
+    lastTime = now;
+    if (dt <= 0) dt = 0.001;
+
+    // Стоп в мёртвой зоне, НО продолжаем удержание
+    if (abs(error) <= deadZone) {
+        // Удержание: легкий П, без ramp
+        float holdPwm = Kp * error * 1.5;
+        holdPwm = constrain(holdPwm, -150, 150);  // слабое усилие
+        driveMotor((int)holdPwm);
+        return;  // motorActive НЕ сбрасываем — продолжаем удерживать
+    }
+
+    // ПД
+    float derivative = (error - lastError) / dt;
+    lastError = error;
+
+    float pwmF = Kp * error - Kd * derivative;   // минус Kd — тормозим производную
+
+    // Минимальная тяга
+    const int minDrivePwm = 200;
+    if (pwmF > 0 && pwmF < minDrivePwm) pwmF = minDrivePwm;
+    if (pwmF < 0 && pwmF > -minDrivePwm) pwmF = -minDrivePwm;
+
+    pwmF = constrain(pwmF, -maxPwm, maxPwm);
+
+    int pwm = (int)pwmF;
+
+    // Ramp
+    static int lastPwm = 0;
+    int delta = pwm - lastPwm;
+    const int maxStep = 8;
+    if (delta >  maxStep) pwm = lastPwm + maxStep;
+    if (delta < -maxStep) pwm = lastPwm - maxStep;
+    lastPwm = pwm;
+
+    driveMotor(pwm);
+}
+
+// Глобальные переменные парсера
+String _args[7];
+int _argCount = 0;
+String last_command = "";
+
+// ── Парсер строки по символу ';' ───────────────
+void parse(String input) {
+    input.trim();
+    _argCount = 0;
+    
+    for(int i = 0; i < 7; i++) {
+        _args[i] = "";
+    }
+    
+    int start = 0;
+    while (start < (int)input.length() && _argCount < 7) {
+        int sep = input.indexOf(';', start);
+        if (sep == -1) sep = input.length();
+        _args[_argCount++] = input.substring(start, sep);
+        start = sep + 1;
+    }
+}
+
+// ── Функции быстрого доступа ───────────────
+String cmd()         { return _args[0]; }
+int    getInt(int i) { return _args[i].toInt(); }
+float  getFloat(int i) { return _args[i].toFloat(); }
+
+// ── Управление пинами гироскутера ───────────────
+void sendCommand(bool state1, bool state2, bool state3, bool state4) {
+    digitalWrite(OUT_PIN1, state1);
+    digitalWrite(OUT_PIN2, state2);
+    digitalWrite(OUT_PIN3, state3);
+    digitalWrite(OUT_PIN4, state4);
+}
+
+// ╔══════════════════════════════════════════════╗
+// ║            COMMAND EXECUTOR                  ║
+// ╚══════════════════════════════════════════════╝
+void executeCommand(String input) {
+    parse(input);
+    last_command = input;  
+    
+    REPLY(">> Выполняю: ");
+    REPLYLN(input);
+    
+    // Блок команд гироскутера
+    if (cmd() == "/stop") {
+        sendCommand(LOW, LOW, LOW, LOW);
+        REPLYLN("Выполнено: STOP (Инвертировано)");
+    } 
+    else if (cmd() == "/forward") {
+        sendCommand(HIGH, LOW, LOW, LOW);
+        REPLYLN("Выполнено: FORWARD (Инвертировано)");
+    } 
+    else if (cmd() == "/forward_fast") {
+        sendCommand(LOW, HIGH, LOW, LOW);
+        REPLYLN("Выполнено: FORWARD_FAST (Инвертировано)");
+    } 
+    else if (cmd() == "/forward_max") {
+        sendCommand(HIGH, HIGH, LOW, LOW);
+        REPLYLN("Выполнено: FORWARD_MAX (Инвертировано)");
+    } 
+    else if (cmd() == "/back") {
+        sendCommand(LOW, LOW, HIGH, LOW);
+        REPLYLN("Выполнено: BACK (Инвертировано)");
+    } 
+    else if (cmd() == "/back_fast") {
+        sendCommand(LOW, LOW, LOW, HIGH);
+        REPLYLN("Выполнено: BACK_FAST (Инвертировано)");
+    } 
+    else if (cmd() == "/back_max") {
+        sendCommand(LOW, LOW, HIGH, HIGH);
+        REPLYLN("Выполнено: BACK_MAX (Инвертировано)");
+    } 
+    else if (cmd() == "/left_tank") {
+        sendCommand(HIGH, LOW, LOW, HIGH);
+        REPLYLN("Выполнено: LEFT_TANK (Инвертировано)");
+    } 
+    else if (cmd() == "/right_tank") {
+        sendCommand(LOW, HIGH, HIGH, LOW);
+        REPLYLN("Выполнено: RIGHT_TANK (Инвертировано)");
+    } 
+    else if (cmd() == "/left") {
+        sendCommand(HIGH, LOW, HIGH, LOW);
+        REPLYLN("Выполнено: LEFT (Инвертировано)");
+    } 
+    else if (cmd() == "/right") {
+        sendCommand(LOW, HIGH, LOW, HIGH);
+        REPLYLN("Выполнено: RIGHT (Инвертировано)");
+    } 
+    else if (cmd() == "/pos") {
+        REPLY("RAW: ");
+        REPLY(currentAdc);
+        REPLY(" | Угол: ");
+        REPLYLN(currentAngle);
+    }
+    else if (cmd() == "/go") {
+        targetAngle = getFloat(1);
+        // Защита от опечаток: не даем уехать дальше физических лимитов
+        targetAngle = constrain(targetAngle, -maxAngle, maxAngle); 
+        motorActive = true;
+        
+        REPLY("Цель мотора: ");
+        REPLYLN(targetAngle);
+    }
+    else if (cmd() == "/m_stop") {
+        motorActive = false;
+        driveMotor(0);
+        REPLYLN("Мотор остановлен");
+    }
+
+    else if (cmd() == "/test_dir") {
+    // Крутим мотор в одну сторону 0.5 секунды и смотрим, куда поехал угол
+    REPLYLN("TEST: LEFT 0.5s ->");
+    REPLY("До:    "); REPLYLN(currentAngle);
+    driveMotor(300);   // Положительный PWM = RPWM (пин 6)
+    delay(500);
+    driveMotor(0);
+    delay(200);
+    REPLY("После: "); REPLYLN(currentAngle);
+    REPLYLN("Если угол ВЫРОС (+) — мотор подключён верно.");
+    REPLYLN("Если угол УПАЛ (-) — перепутаны RPWM и LPWM (пины 6/7).");
+}
+
+    else if (cmd() == "/turn") {
+        int newMaxPwm = getInt(1);
+        float newTarget = getFloat(2);
+
+        // Защиты от мусора
+        newMaxPwm = constrain(newMaxPwm, 0, 1023);
+        newTarget = constrain(newTarget, -maxAngle, maxAngle);
+
+        maxPwm      = newMaxPwm;
+        targetAngle = newTarget;
+        motorActive = true;
+
+        REPLY("P-регулятор: цель=");
+        REPLY(newTarget);
+        REPLY(", потолок PWM=");
+        REPLYLN(newMaxPwm);
+    }
+    
+    else {
+        REPLY("Ошибка: неизвестная команда '");
+        REPLY(cmd());
+        REPLYLN("'");
+    }
+}
+
+// ── Обработка команд от ESP32 ───────────────
+void handleESP32() {
+    if (!EspSerial.available()) return;
+    
+    String input = EspSerial.readStringUntil('\n');
+    input.trim();
+    
+    if (input.length() > 0) {
+        replyPort = &EspSerial; // Переключаем ответы на ESP32
+        executeCommand(input);
+    }
+}
+
+// ── Обработка команд с ПК (USB) ───────────────
+void handleUSB() {
+    if (!Serial.available()) return;
+    
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    
+    if (input.length() > 0) {
+        replyPort = &Serial; // Переключаем ответы на USB
+        executeCommand(input);
+    }
+}
+
+
+// ── Аппаратная настройка Таймера 4 ──
+void setupMotorPWM() {
+    pinMode(RPWM_PIN, OUTPUT);
+    pinMode(LPWM_PIN, OUTPUT);
+    pinMode(EN_PIN, OUTPUT);
+
+    digitalWrite(EN_PIN, LOW); // Глушим драйвер на старте
+
+    // Включаем Fast PWM 10-bit (Разрешение: 0-1023, Частота: 15.6 кГц)
+    TCCR4A = (1 << COM4A1) | (1 << COM4B1) | (1 << WGM41) | (1 << WGM40);
+    TCCR4B = (1 << WGM42) | (1 << CS40); // Prescaler = 1 (работа без делителя)
+
+    OCR4A = 0;
+    OCR4B = 0;
+}
+
+void setup() {
+    Serial.begin(115200);    // Монитор порта ПК
+    Serial.setTimeout(5);
+
+    EspSerial.begin(115200); // Связь с ESP32
+    EspSerial.setTimeout(5);
+
+    pinMode(OUT_PIN1, OUTPUT);
+    pinMode(OUT_PIN2, OUTPUT);
+    pinMode(OUT_PIN3, OUTPUT);
+    pinMode(OUT_PIN4, OUTPUT);
+
+    // Настройка IBT_2 на высокой частоте
+    setupMotorPWM();
+
+    // Инициализация гироскутера в состоянии STOP
+    sendCommand(LOW, LOW, LOW, LOW);
+    
+    REPLYLN("Mega готова.");
+    REPLYLN("Ожидаю команды...");
+}
+
+void loop() {
+    handleESP32();
+    handleUSB();
+    calculatePosition(); 
+    updateMotor();
+}
+
+/*
+/go;0
+/turn;500;0
+/pos
+*/

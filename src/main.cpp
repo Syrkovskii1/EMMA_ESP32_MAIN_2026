@@ -2208,6 +2208,42 @@ void send_to_mega(String cmd) {
 
 
 
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║            GYRO-SCOOTER (HOVER)                                     ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// ── Остановка гироскутера ──
+// Всё время движения отслеживает Arduino Mega, поэтому ESP32 просто
+// отправляет ей команду полной остановки: обе скорости = 0.
+// reason — необязательный комментарий для лога
+void hover_stop(const char* reason = "") {
+    send_to_mega("/hover;0;0;0");
+
+    if (reason && reason[0] != '\0') {
+        LOG_PRINTF("[HOVER] STOP (%s)\n", reason);
+    } else {
+        LOG_PRINTLN("[HOVER] STOP");
+    }
+}
+
+// ── Запуск движения гироскутера ──
+// left     : скорость ЛЕВОГО мотора  (-50..50). Значение передаётся как есть,
+//            без ограничений и проверок — ограничивает сама Mega.
+// right    : скорость ПРАВОГО мотора (-50..50). То же самое.
+// time_ms  : время действия команды в мс. Отсчитывает Mega.
+//            0 — едем до следующей команды.
+void hover_start(int left, int right, unsigned long time_ms) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "/hover;%d;%d;%lu", left, right, time_ms);
+
+    send_to_mega(String(buf));
+
+    LOG_PRINTF("[HOVER] L=%d R=%d T=%lu мс -> %s\n",
+               left, right, time_ms, buf);
+}
+
+
+
 // ╔══════════════════════════════════════════════╗
 // ║            COMMAND EXECUTOR                  ║
 // ╚══════════════════════════════════════════════╝
@@ -2287,6 +2323,9 @@ void executeCommand(String input) {
         LOG_PRINTLN("/end                    - Завершить запись сценария");
         LOG_PRINTLN("/play                   - Воспроизвести сценарий");
         LOG_PRINTLN("/stop                   - Остановить воспроизведение");
+        LOG_PRINTLN("\n--- 🛴 ГИРОСКУТЕР ---");
+        LOG_PRINTLN("/hover;L;R;T            - Ехать: L(скорость левого -50..50), R(правого), T(мс)");
+        LOG_PRINTLN("/stop                   - Остановить сценарий и гироскутер");
         LOG_PRINTLN("\n--- 🎯 УМНАЯ СИНХРОНИЗАЦИЯ (AUTO_SYNC) ---");
         LOG_PRINTLN("/auto_sync;1            - Включить авто-коррекцию времени смычка");
         LOG_PRINTLN("/auto_sync;0            - Выключить авто-коррекцию");
@@ -2881,6 +2920,28 @@ void executeCommand(String input) {
 
     if (cmd() == "/stop") {
         queue_stop();
+        // Экстренная остановка всего сценария останавливает и гироскутер
+        hover_stop("экстренная остановка сценария");
+    }
+
+    // ── 9. ГИРОСКУТЕР ──
+    // /hover;L;R;T — L: скорость левого мотора, R: правого, T: время действия (мс)
+    if (cmd() == "/hover") {
+        if (_argCount < 3) {
+            LOG_PRINTLN("[HOVER] ОШИБКА: Формат: /hover;<левый>;<правый>;[время мс]");
+            beep_no();
+        } else {
+            // Значения скоростей передаём как есть, без ограничений
+            int           left     = getInt(1);
+            int           right    = getInt(2);
+            unsigned long time_ms  = 0;
+            if (_argCount >= 4) {
+                int t = getInt(3);
+                time_ms = (t > 0) ? (unsigned long)t : 0;   // отрицательное/0 = без таймера
+            }
+
+            hover_start(left, right, time_ms);
+        }
     }
 
     // sound 
