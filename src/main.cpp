@@ -47,6 +47,9 @@ LogRoute currentLogMode = LOG_BOTH;
     if (currentLogMode == LOG_ONLY_BT  || currentLogMode == LOG_BOTH) SerialBT.print(x); \
 }
 
+// Безусловный вывод — работает даже при LOG_SILENT
+#define ECHO_PRINTLN(x) { Serial.println(x); SerialBT.println(x); }
+
 
 // ╔══════════════════════════════════════════════╗
 // ║            MAIN SETTINGS                     ║
@@ -2337,6 +2340,7 @@ void executeCommand(String input) {
         LOG_PRINTLN("\n--- 🔊 ЗВУК И СИГНАЛЫ ---");
         LOG_PRINTLN("/yes                    - Проиграть яркий звук подтверждения (OK)");
         LOG_PRINTLN("/no                     - Проиграть угасающий звук отказа (NO)");
+        LOG_PRINTLN("/echo;TEXT              - Вывести TEXT в порт (работает при LOG_SILENT)");
     }
 
     // ── 2. СИСТЕМА И ПАМЯТЬ ──
@@ -2942,6 +2946,12 @@ void executeCommand(String input) {
 
             hover_start(left, right, time_ms);
         }
+    }
+
+    // ── ECHO (работает ВСЕГДА, даже при LOG_SILENT) ──
+    if (cmd() == "/echo") {
+        String msg = (_argCount >= 2) ? _args[1] : "";
+        ECHO_PRINTLN(msg);
     }
 
     // sound 
